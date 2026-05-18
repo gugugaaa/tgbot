@@ -16,8 +16,9 @@ export class ChatTaskDurableObject {
       createdAt: Date.now(),
       status: "queued",
     });
+	// 比如单人一次发多条命令，逐个解决（要是DO还活着）
     await this.state.storage.put("queue", queue);
-    await this.state.storage.setAlarm(Date.now() + 100);
+    await this.state.storage.setAlarm(Date.now() + 100);  // 异步消费
 
     return new Response("queued");
   }
@@ -33,7 +34,7 @@ export class ChatTaskDurableObject {
     await this.state.storage.put("running", true);
 
     try {
-      await sendTelegramMessage(this.env, job.chatId, "⏳ 已收到，正在等待模型回复。");
+      await sendTelegramMessage(this.env, job.chatId, "⏳ 已收到，大约2分钟后回复。");
 
       const aiReply = await askAI(this.env, job.messages, job.thinkState);
 
@@ -140,7 +141,7 @@ export default {
 
       const id = env.CHAT_TASKS.idFromName(chatId);
       const task = env.CHAT_TASKS.get(id);
-      ctx.waitUntil(task.fetch("https://chat-task.local/queue", {
+      ctx.waitUntil(task.fetch("https://spaghetti.code/queue", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ chatId, userText, messages, history, thinkState }),
@@ -160,7 +161,7 @@ async function askAI(env, messages, thinkState) {
   };
 
   if (thinkState === "on") {
-    body.include_reasoning = true;
+    body.include_reasoning = true; // OpenRouter 统一参数
   }
 
   const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
@@ -188,7 +189,7 @@ async function askAI(env, messages, thinkState) {
 async function sendTelegramMessage(env, chatId, text) {
   if (!text) return;
 
-  let finalText = text.replace(/\n+/g, "\n\n");
+  let finalText = text.replace(/\n+/g, "\n\n");   // 好看些
 
   if (finalText.length > 4000) {
     finalText = finalText.slice(0, 4000) + "\n\n[⚠️ 消息过长已被截断]";
