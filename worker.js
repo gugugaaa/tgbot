@@ -34,18 +34,26 @@ export class ChatTaskDurableObject {
     await this.state.storage.put("running", true);
 
     try {
-      await sendTelegramMessage(this.env, job.chatId, "⏳ 已收到，大约2分钟后回复。");
+      await sendTelegramTyping(this.env, job.chatId);
 
-      const aiReply = await askAI(this.env, job.messages, job.thinkState);
+      const typingInterval = setInterval(() => {
+        sendTelegramTyping(this.env, job.chatId).catch(console.error);
+      }, 4000);
 
-      if (job.thinkState === "on" && aiReply.reasoning) {
-        await sendTelegramMessage(this.env, job.chatId, `🤔 *思考过程：*\n\n${aiReply.reasoning}`);
+      try {
+        const aiReply = await askAI(this.env, job.messages, job.thinkState);
+
+        if (job.thinkState === "on" && aiReply.reasoning) {
+          await sendTelegramMessage(this.env, job.chatId, `🤔 *思考过程：*\n\n${aiReply.reasoning}`);
+        }
+        await sendTelegramMessage(this.env, job.chatId, aiReply.content);
+
+        job.history.push({ role: "user", content: job.userText });
+        job.history.push({ role: "assistant", content: aiReply.content });
+        await this.env.BOT_KV.put(`history_${job.chatId}`, JSON.stringify(job.history.slice(-20)));
+      } finally {
+        clearInterval(typingInterval);
       }
-      await sendTelegramMessage(this.env, job.chatId, aiReply.content);
-
-      job.history.push({ role: "user", content: job.userText });
-      job.history.push({ role: "assistant", content: aiReply.content });
-      await this.env.BOT_KV.put(`history_${job.chatId}`, JSON.stringify(job.history.slice(-20)));
     } catch (err) {
       console.error("AI 报错:", err);
       await this.state.storage.put("lastError", {
@@ -202,6 +210,19 @@ async function sendTelegramMessage(env, chatId, text) {
       chat_id: chatId,
       text: finalText,
       parse_mode: "Markdown",
+    }),
+  });
+}
+
+async function sendTelegramTyping(env, chatId) {
+  await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendChatAction`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      chat_id: chatId,
+      action: "typing",
     }),
   });
 }
