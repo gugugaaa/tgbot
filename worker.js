@@ -1,3 +1,7 @@
+import { sendTelegramMessage, sendTelegramTyping, notifyTelegram } from "./tg_api.js";
+import { askAIStream } from "./openrouter.js";
+import { parseCommand, COMMAND_HANDLERS } from "./commands.js";
+
 export class ChatTaskDurableObject {
   constructor(state, env) {
     this.state = state;
@@ -170,10 +174,10 @@ export default {
 
       chatId = message.chat.id.toString();
       const userText = message.text.trim();
+      const commandRequest = parseCommand(userText);
 
-      if (userText === "/whoami") {
-        await sendTelegramMessage(env, chatId, `你的 Chat ID 是：${chatId}`);
-        return new Response("ok");
+      if (commandRequest?.command === "whoami") {
+        return await COMMAND_HANDLERS.whoami({ env, chatId });
       }
 
       if (env.ADMIN_CHAT_ID && chatId !== env.ADMIN_CHAT_ID) {
@@ -181,74 +185,9 @@ export default {
         return new Response("Unauthorized");
       }
 
-      if (userText === "/prompt") {
-        let systemPrompt = (await env.BOT_KV.get(`prompt_${chatId}`)) || env.DEFAULT_PROMPT;
-        await sendTelegramMessage(env, chatId, `💬当前提示词：\n\n${systemPrompt}`);
-        return new Response("ok");
-      }
-
-      if (userText.startsWith("/prompt ")) {
-        await env.BOT_KV.put(`prompt_${chatId}`, userText.replace("/prompt ", ""));
-        await sendTelegramMessage(env, chatId, "✅ Prompt 已更新");
-        return new Response("ok");
-      }
-
-      if (userText === "/resetprompt") {
-        await env.BOT_KV.delete(`prompt_${chatId}`);
-        await sendTelegramMessage(env, chatId, "♻️ 已恢复默认 prompt");
-        return new Response("ok");
-      }
-
-      if (userText === "/clear") {
-        await env.BOT_KV.delete(`history_${chatId}`);
-        await sendTelegramMessage(env, chatId, "🧹 已清空聊天历史");
-        return new Response("ok");
-      }
-
-      if (userText === "/think on") {
-        await env.BOT_KV.put(`think_${chatId}`, "on");
-        await sendTelegramMessage(env, chatId, "🧠 思考模式已开启");
-        return new Response("ok");
-      }
-
-      if (userText === "/think off") {
-        await env.BOT_KV.put(`think_${chatId}`, "off");
-        await sendTelegramMessage(env, chatId, "💨 思考模式已关闭");
-        return new Response("ok");
-      }
-
-      if (userText === "/think") {
-        let currentState = (await env.BOT_KV.get(`think_${chatId}`)) || "off";
-        await sendTelegramMessage(env, chatId, `当前思考模式：${currentState === "on" ? "🟢 已开启" : "🔴 已关闭"}`);
-        return new Response("ok");
-      }
-
-      if (userText === "/chunk") {
-        const currentChunk = (await env.BOT_KV.get(`chunk_${chatId}`)) || "500";
-        const currentText = currentChunk === "off" ? "关闭" : `${currentChunk} 字符`;
-        await sendTelegramMessage(env, chatId, `当前分块发送：${currentText}`);
-        return new Response("ok");
-      }
-
-      if (userText === "/chunk off") {
-        await env.BOT_KV.put(`chunk_${chatId}`, "off");
-        await sendTelegramMessage(env, chatId, "✅ 分块发送已关闭");
-        return new Response("ok");
-      }
-
-      if (userText.startsWith("/chunk ")) {
-        const rawValue = userText.slice(7).trim();
-        const parsed = Number.parseInt(rawValue, 10);
-
-        if (Number.isNaN(parsed)) {
-          await sendTelegramMessage(env, chatId, "分块长度只支持 100-1000");
-          return new Response("ok");
-        }
-
-        const chunkSize = Math.min(1000, Math.max(100, parsed));
-        await env.BOT_KV.put(`chunk_${chatId}`, String(chunkSize));
-        await sendTelegramMessage(env, chatId, `✅ 分块发送已设置为 ${chunkSize} 字符`);
-        return new Response("ok");
+      if (commandRequest) {
+        const handler = COMMAND_HANDLERS[commandRequest.command] || COMMAND_HANDLERS.help;
+        return await handler({ env, chatId, args: commandRequest.args });
       }
       
       // 并行获取 KV
@@ -310,169 +249,6 @@ export default {
   },
 };
 
-async function askAIStream(env, messages, thinkState, onText) {
-  const body = {
-    model: "deepseek/deepseek-v4-pro",
-    messages,
-    stream: true,
-  };
-
-  body.reasoning = thinkState === "on"
-    ? { enabled: true, effort: "medium", exclude: false }
-    : { enabled: false, exclude: true };
-  // 来自 https://openrouter.ai/docs/guides/best-practices/reasoning-tokens
-
-  const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${env.OPENROUTER_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
-
-  if (!response.ok) {
-    const data = await readErrorJson(response);
-    throw new Error(data?.error?.message || data?.message || `OpenRouter HTTP ${response.status}`);
-  }
-
-  const reader = response.body?.getReader();
-  if (!reader) {
-    throw new Error("OpenRouter SSE 响应不可读");
-  }
-
-  const decoder = new TextDecoder();
-  let buffer = "";
-  let fullContent = "";
-  let reasoning = "";
-
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-
-    buffer += decoder.decode(value, { stream: true });
-    const events = buffer.split("\n\n");
-    buffer = events.pop() || "";
-
-    for (const event of events) {
-      const lines = event.split("\n");
-      for (const line of lines) {
-        // 例如 data: {"choices":[{"delta":{"content":"Hi"}}]}
-        if (!line.startsWith("data:")) continue;
-
-        const data = line.slice(5).trim();
-        if (!data || data === "[DONE]") continue;
-
-        try {
-          const parsed = JSON.parse(data);
-          const delta = parsed?.choices?.[0]?.delta;
-          const text = extractDeltaText(delta);
-
-          if (delta?.reasoning) {
-            reasoning += delta.reasoning;
-          }
-
-          if (text) {
-            fullContent += text;
-            try {
-              await onText(text);
-            } catch (err) {
-              console.error("流式回调失败:", err);
-            }
-          }
-        } catch (err) {
-          console.error("SSE 数据解析失败:", err);
-        }
-      }
-    }
-  }
-
-  return {
-    content: fullContent || "AI 回复失败",
-    reasoning,
-  };
-}
-
-function extractDeltaText(delta) {
-  if (!delta) return "";
-
-  if (typeof delta.content === "string") {
-    return delta.content;
-  }
-
-  if (Array.isArray(delta.content)) {
-    return delta.content
-      .map((item) => {
-        if (typeof item === "string") return item;
-        if (item?.type === "text") return item.text || "";
-        return "";
-      })
-      .join("");
-  }
-
-  return "";
-}
-
-async function sendTelegramMessage(env, chatId, text) {
-  if (!text) return;
-
-  let finalText = text;
-
-  // 基本没这个情况我就不管了
-  if (finalText.length > 4000) {
-    finalText = finalText.slice(0, 4000) + "\n\n[⚠️ 消息过长已被截断]";
-  }
-
-  const response = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      chat_id: chatId,
-      text: finalText,
-    }),
-  });
-  
-  let data;
-  try {
-    data = await response.json();
-  } catch (err) {
-    if (response.ok) throw err;
-    data = {};
-  }
-
-  if (!response.ok) {
-    throw new Error(data?.description || `Telegram HTTP ${response.status}`);
-  }
-
-  return data;
-}
-
-async function sendTelegramTyping(env, chatId) {
-  const response = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendChatAction`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      chat_id: chatId,
-      action: "typing",
-    }),
-  });
-
-  if (!response.ok) {
-    const data = await readErrorJson(response);
-    throw new Error(data?.description || `Telegram typing HTTP ${response.status}`);
-  }
-}
-
-async function notifyTelegram(env, chatId, text) {
-  try {
-    await sendTelegramMessage(env, chatId, text);
-  } catch (err) {
-    console.error("通知用户失败:", err);
-  }
-}
-
 function parseHistory(raw, chatId) {
   if (!raw) return [];
 
@@ -482,14 +258,6 @@ function parseHistory(raw, chatId) {
   } catch (err) {
     console.error(`历史记录解析失败 chatId=${chatId}:`, err);
     return [];
-  }
-}
-
-async function readErrorJson(response) {
-  try {
-    return await response.json();
-  } catch {
-    return {};
   }
 }
 
