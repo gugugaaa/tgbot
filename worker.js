@@ -2,7 +2,7 @@ export class ChatTaskDurableObject {
   constructor(state, env) {
     this.state = state;
     this.env = env;
-    this.streamBuffers = new Map();   // 中途被掐不保存，这种对话没意义
+    this.streamBuffers = new Map();   // DO 中途被掐不保存，这种对话没意义
   }
 
   async fetch(request) {
@@ -17,7 +17,7 @@ export class ChatTaskDurableObject {
       createdAt: Date.now(),
       status: "queued",
     });
-	// 比如单人一次发多条命令，逐个解决（要是DO还活着）
+	// 比如单人一次发多条命令，逐个解决（要是 DO 还活着）
     await this.state.storage.put("queue", queue);
     await this.state.storage.setAlarm(Date.now() + 100);  // 异步消费
 
@@ -37,6 +37,7 @@ export class ChatTaskDurableObject {
     try {
       await sendTelegramTyping(this.env, job.chatId);
 
+      // 每 4 秒发送一次 typing
       const typingInterval = setInterval(() => {
         sendTelegramTyping(this.env, job.chatId).catch(console.error);
       }, 4000);
@@ -73,6 +74,7 @@ export class ChatTaskDurableObject {
     }
   }
 
+  // SSE中攒到一定量就发一段
   async appendAndMaybeFlushChunk(chatId, text, chunkSize) {
     if (!text) return;
 
@@ -82,15 +84,39 @@ export class ChatTaskDurableObject {
 
     if (chunkSize === 0) return;
 
-    while ((this.streamBuffers.get(chatId) || "").length >= chunkSize) {
+    let sentAnyChunk = false;
+
+    while (true) {
       const buffer = this.streamBuffers.get(chatId) || "";
-      const slice = buffer.slice(0, chunkSize);
-      const remain = buffer.slice(chunkSize);
+
+      if (buffer.length < chunkSize) {
+        break;
+      }
+
+      // 从 chunkSize 位置开始寻找换行符
+      const newlineIndex = buffer.indexOf("\n", chunkSize);
+
+      if (newlineIndex === -1) {
+        // 没有找到换行符，等待更多数据
+        break;
+      }
+
+      // 发送到换行符为止
+      const slice = buffer.slice(0, newlineIndex + 1);
+      const remain = buffer.slice(newlineIndex + 1);
       this.streamBuffers.set(chatId, remain);
       await sendTelegramMessage(this.env, chatId, slice);
+      sentAnyChunk = true;
+    }
+
+    // Telegram 发送消息后会结束当前 typing 展示
+    // 中途只要发出过 chunk，就补一次 typing，活到4秒以后
+    if (sentAnyChunk) {
+      sendTelegramTyping(this.env, chatId).catch(console.error);
     }
   }
 
+  // 结束时把剩下没发的尾巴发出去
   async flushChunk(chatId) {
     const rest = this.streamBuffers.get(chatId) || "";
     if (!rest) return;
@@ -112,6 +138,11 @@ export default {
 
       const chatId = message.chat.id.toString();
       const userText = message.text.trim();
+
+      if (userText === "/whoami") {
+        await sendTelegramMessage(env, chatId, `你的 Chat ID 是：${chatId}`);
+        return new Response("ok");
+      }
 
       if (env.ADMIN_CHAT_ID && chatId !== env.ADMIN_CHAT_ID) {
         return new Response("Unauthorized");
@@ -138,11 +169,6 @@ export default {
       if (userText === "/clear") {
         await env.BOT_KV.delete(`history_${chatId}`);
         await sendTelegramMessage(env, chatId, "🧹 已清空聊天历史");
-        return new Response("ok");
-      }
-
-      if (userText === "/whoami") {
-        await sendTelegramMessage(env, chatId, `你的 Chat ID 是：${chatId}`);
         return new Response("ok");
       }
 
@@ -182,7 +208,7 @@ export default {
         const parsed = Number.parseInt(rawValue, 10);
 
         if (Number.isNaN(parsed)) {
-          await sendTelegramMessage(env, chatId, "分块长度只支持 100-1000，或使用 /chunk off");
+          await sendTelegramMessage(env, chatId, "分块长度只支持 100-1000");
           return new Response("ok");
         }
 
