@@ -10,32 +10,51 @@ export class ChatTaskDurableObject {
       return new Response("ok");
     }
 
-    const job = await request.json();
-    const queue = (await this.state.storage.get("queue")) || [];
-    queue.push({
-      ...job,
-      createdAt: Date.now(),
-      status: "queued",
+    let job;
+    try {
+      job = await request.json();
+    } catch (err) {
+      console.error("队列请求 JSON 解析失败:", err);
+      return new Response("bad request", { status: 400 });
+    }
+
+    if (!job?.chatId || !Array.isArray(job.messages)) {
+      console.error("队列请求参数不完整:", job);
+      return new Response("bad request", { status: 400 });
+    }
+
+    // 锁住队列并发
+    await this.state.blockConcurrencyWhile(async () => {
+      const queue = (await this.state.storage.get("queue")) || [];
+      queue.push({
+        ...job,
+        createdAt: Date.now(),
+        status: "queued",
+      });
+      // 比如单人一次发多条命令，逐个解决（要是 DO 还活着）
+      await this.state.storage.put("queue", queue);
+      await this.state.storage.setAlarm(Date.now() + 100); // 异步消费
     });
-	// 比如单人一次发多条命令，逐个解决（要是 DO 还活着）
-    await this.state.storage.put("queue", queue);
-    await this.state.storage.setAlarm(Date.now() + 100);  // 异步消费
 
     return new Response("queued");
   }
 
   async alarm() {
-    if (await this.state.storage.get("running")) return;
+    let job;
+    await this.state.blockConcurrencyWhile(async () => {
+      if (await this.state.storage.get("running")) return;
 
-    const queue = (await this.state.storage.get("queue")) || [];
-    const job = queue.shift();
+      const queue = (await this.state.storage.get("queue")) || [];
+      job = queue.shift();
+      if (!job) return;
+
+      await this.state.storage.put("queue", queue);
+      await this.state.storage.put("running", true);
+    });
     if (!job) return;
 
-    await this.state.storage.put("queue", queue);
-    await this.state.storage.put("running", true);
-
     try {
-      await sendTelegramTyping(this.env, job.chatId);
+      await sendTelegramTyping(this.env, job.chatId).catch((err) => console.error("发送 typing 失败:", err));
 
       // 每 4 秒发送一次 typing
       const typingInterval = setInterval(() => {
@@ -61,15 +80,20 @@ export class ChatTaskDurableObject {
       await this.state.storage.put("lastError", {
         ...job,
         status: "failed",
-        error: err?.message || String(err),
+        error: errorMessage(err),
         failedAt: Date.now(),
       });
-      await sendTelegramMessage(this.env, job.chatId, "❌ AI 回复出错了，请稍后再试。");
+      await notifyTelegram(this.env, job.chatId, "❌ DO 出错了");
+      // 报错的记录不会入队
     } finally {
-      await this.state.storage.delete("running");
-      const remaining = (await this.state.storage.get("queue")) || [];
-      if (remaining.length > 0) {
-        await this.state.storage.setAlarm(Date.now() + 100);
+      try {
+        await this.state.storage.delete("running");
+        const remaining = (await this.state.storage.get("queue")) || [];
+        if (remaining.length > 0) {
+          await this.state.storage.setAlarm(Date.now() + 100);
+        }
+      } catch (err) {
+        console.error("清理 DO 状态失败:", err);
       }
     }
   }
@@ -112,7 +136,7 @@ export class ChatTaskDurableObject {
     // Telegram 发送消息后会结束当前 typing 展示
     // 中途只要发出过 chunk，就补一次 typing，活到4秒以后
     if (sentAnyChunk) {
-      sendTelegramTyping(this.env, chatId).catch(console.error);
+      sendTelegramTyping(this.env, chatId).catch((err) => console.error("补 typing 失败:", err));
     }
   }
 
@@ -130,13 +154,21 @@ export default {
   async fetch(request, env, ctx) {
     if (request.method !== "POST") return new Response("Bot running");
 
+    let chatId;
+
     try {
-      const update = await request.json();
+      const update = await request.json().catch((err) => {
+        console.error("Webhook JSON 解析失败:", err);
+        return null;
+      });
+
+      if (!update) return new Response("ok");
+
       const message = update.message;
 
       if (!message?.text) return new Response("ok");
 
-      const chatId = message.chat.id.toString();
+      chatId = message.chat.id.toString();
       const userText = message.text.trim();
 
       if (userText === "/whoami") {
@@ -145,6 +177,7 @@ export default {
       }
 
       if (env.ADMIN_CHAT_ID && chatId !== env.ADMIN_CHAT_ID) {
+        // Telegram webhook 非 2xx 会触发重试，别发真的403
         return new Response("Unauthorized");
       }
 
@@ -217,11 +250,19 @@ export default {
         await sendTelegramMessage(env, chatId, `✅ 分块发送已设置为 ${chunkSize} 字符`);
         return new Response("ok");
       }
+      
+      // 并行获取 KV
+      const [promptRaw, thinkRaw, historyRaw, chunkSettingRaw] = await Promise.all([
+        env.BOT_KV.get(`prompt_${chatId}`),
+        env.BOT_KV.get(`think_${chatId}`),
+        env.BOT_KV.get(`history_${chatId}`),
+        env.BOT_KV.get(`chunk_${chatId}`),
+      ]);
 
-      let systemPrompt = (await env.BOT_KV.get(`prompt_${chatId}`)) || env.DEFAULT_PROMPT;
-      let thinkState = (await env.BOT_KV.get(`think_${chatId}`)) || "off";
-      let history = JSON.parse((await env.BOT_KV.get(`history_${chatId}`)) || "[]");
-      const chunkSetting = (await env.BOT_KV.get(`chunk_${chatId}`)) || "500";
+      const systemPrompt = promptRaw || env.DEFAULT_PROMPT;
+      const thinkState = thinkRaw || "off";
+      const history = parseHistory(historyRaw, chatId);
+      const chunkSetting = chunkSettingRaw || "500";
       const currentChunkSize = chunkSetting === "off"
         ? 0
         : Math.min(1000, Math.max(100, Number.parseInt(chunkSetting, 10) || 500));
@@ -234,22 +275,37 @@ export default {
 
       const id = env.CHAT_TASKS.idFromName(chatId);
       const task = env.CHAT_TASKS.get(id);
-      ctx.waitUntil(task.fetch("https://spaghetti.code/queue", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          chatId,
-          userText,
-          messages,
-          history,
-          thinkState,
-          chunkSize: currentChunkSize,
-        }),
+      ctx.waitUntil((async () => {
+        const response = await task.fetch("https://spaghetti.code/queue", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            chatId,
+            userText,
+            messages,
+            history,
+            thinkState,
+            chunkSize: currentChunkSize,
+          }),
+        });
+
+        if (!response.ok) {
+          console.error("任务入队失败:", response.status, await response.text().catch(() => ""));
+          await notifyTelegram(env, chatId, "❌ 任务入队失败，请稍后再试。");
+        }
+      })().catch((err) => {
+        console.error("任务入队异常:", err);
+        return notifyTelegram(env, chatId, "❌ 任务入队失败，请稍后再试。");
       }));
 
       return new Response("ok");
     } catch (err) {
-      return new Response(JSON.stringify({ error: err.message }), { status: 500 });
+      console.error("Webhook 处理失败:", err);
+      if (chatId) {
+        ctx.waitUntil(notifyTelegram(env, chatId, "❌ Worker 出错了"));
+      }
+      // 保持 2xx，避免 Telegram webhook 重试导致重复入队
+      return new Response("failed");
     }
   },
 };
@@ -261,9 +317,10 @@ async function askAIStream(env, messages, thinkState, onText) {
     stream: true,
   };
 
-  if (thinkState === "on") {
-    body.include_reasoning = true; // OpenRouter 统一参数
-  }
+  body.reasoning = thinkState === "on"
+    ? { enabled: true, effort: "medium", exclude: false }
+    : { enabled: false, exclude: true };
+  // 来自 https://openrouter.ai/docs/guides/best-practices/reasoning-tokens
 
   const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",
@@ -275,8 +332,8 @@ async function askAIStream(env, messages, thinkState, onText) {
   });
 
   if (!response.ok) {
-    const data = await response.json();
-    throw new Error(data?.error?.message || `OpenRouter HTTP ${response.status}`);
+    const data = await readErrorJson(response);
+    throw new Error(data?.error?.message || data?.message || `OpenRouter HTTP ${response.status}`);
   }
 
   const reader = response.body?.getReader();
@@ -300,6 +357,7 @@ async function askAIStream(env, messages, thinkState, onText) {
     for (const event of events) {
       const lines = event.split("\n");
       for (const line of lines) {
+        // 例如 data: {"choices":[{"delta":{"content":"Hi"}}]}
         if (!line.startsWith("data:")) continue;
 
         const data = line.slice(5).trim();
@@ -360,11 +418,12 @@ async function sendTelegramMessage(env, chatId, text) {
 
   let finalText = text;
 
+  // 基本没这个情况我就不管了
   if (finalText.length > 4000) {
     finalText = finalText.slice(0, 4000) + "\n\n[⚠️ 消息过长已被截断]";
   }
 
-  await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+  const response = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -372,10 +431,24 @@ async function sendTelegramMessage(env, chatId, text) {
       text: finalText,
     }),
   });
+  
+  let data;
+  try {
+    data = await response.json();
+  } catch (err) {
+    if (response.ok) throw err;
+    data = {};
+  }
+
+  if (!response.ok) {
+    throw new Error(data?.description || `Telegram HTTP ${response.status}`);
+  }
+
+  return data;
 }
 
 async function sendTelegramTyping(env, chatId) {
-  await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendChatAction`, {
+  const response = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendChatAction`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -385,4 +458,41 @@ async function sendTelegramTyping(env, chatId) {
       action: "typing",
     }),
   });
+
+  if (!response.ok) {
+    const data = await readErrorJson(response);
+    throw new Error(data?.description || `Telegram typing HTTP ${response.status}`);
+  }
+}
+
+async function notifyTelegram(env, chatId, text) {
+  try {
+    await sendTelegramMessage(env, chatId, text);
+  } catch (err) {
+    console.error("通知用户失败:", err);
+  }
+}
+
+function parseHistory(raw, chatId) {
+  if (!raw) return [];
+
+  try {
+    const history = JSON.parse(raw);
+    return Array.isArray(history) ? history : [];
+  } catch (err) {
+    console.error(`历史记录解析失败 chatId=${chatId}:`, err);
+    return [];
+  }
+}
+
+async function readErrorJson(response) {
+  try {
+    return await response.json();
+  } catch {
+    return {};
+  }
+}
+
+function errorMessage(err) {
+  return err?.message || String(err);
 }
