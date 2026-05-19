@@ -158,6 +158,14 @@ export default {
   async fetch(request, env, ctx) {
     if (request.method !== "POST") return new Response("Bot running");
 
+    // 验证 Telegram webhook secret token，避免伪造update
+    if (env.TELEGRAM_SECRET_TOKEN) {
+      const got = request.headers.get("X-Telegram-Bot-Api-Secret-Token");
+      if (got !== env.TELEGRAM_SECRET_TOKEN) {
+        return new Response("ok");
+      }
+    }
+
     let chatId;
 
     try {
