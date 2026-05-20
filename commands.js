@@ -1,7 +1,7 @@
 import { sendTelegramMessage } from "./tg_api.js";
 
 const HELP_TEXT = [
-  "可用命令：",
+  "一次输入仅执行一个命令：",
   "/help - 显示帮助",
   "/whoami - 显示当前 Chat ID",
   "/prompt - 查看当前 prompt",
@@ -108,13 +108,20 @@ export const COMMAND_HANDLERS = {
 };
 
 export function parseCommand(text) {
-  const firstLine = text.split(/\r?\n/, 1)[0].trim();
+  const lines = text.split(/\r?\n/);
+  const firstLine = lines[0].trim();
   if (!firstLine.startsWith("/")) return null;
 
   const [rawName, ...argParts] = firstLine.slice(1).split(/\s+/);
   const name = rawName || "";
   const command = name.split("@")[0];
-  const args = argParts.join(" ").trim();
+  
+  let args = argParts.join(" ").trim();
+  
+  if (lines.length > 1) {
+    const restLines = lines.slice(1).join("\n");
+    args = args ? args + "\n" + restLines : restLines;
+  }
 
   return { command, args };
 }
