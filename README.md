@@ -3,7 +3,7 @@ Cloudflare Workers + Durable Objs 部署的 Telegram AI 机器人，默认通过
 
 ## 核心特性
 - **增长壁钟墙**：用 worker 唤醒 DO，DO 壁钟墙足以等 2min +
-- **流式输出**：SSE 接收，分 chunk 推送至 Tg。
+- **流式输出**：SSE 接收，分 chunk 推送至 TG。
 - **细节 UX**：chunk 美化，刷新 typing，/prompt 传参支持换行
 - 其他 **chatbot 基础功能** 该有的都有：
 	- 上下文记忆（kv 存储）
@@ -14,8 +14,12 @@ Cloudflare Workers + Durable Objs 部署的 Telegram AI 机器人，默认通过
 		- 自定义系统提示词
 		- 其他配置
 
-<a href="https://i.ibb.co/VcxjjyHM/1.png" >设置自定义Prompt</a>
-<a href="https://i.ibb.co/1GpMFQJP/2.png" >流式传输</a>
+<table border="0">
+  <tr>
+    <td><img src="https://i.ibb.co/VcxjjyHM/1.png" alt="设置自定义Prompt" height="400" /></td>
+    <td><img src="https://i.ibb.co/1GpMFQJP/2.png" alt="流式传输" height="400" /></td>
+  </tr>
+</table>
 
 ## 环境要求
 - Node.js & npm
@@ -76,4 +80,6 @@ npm run deploy
 - `tg_api.js`：Telegram 接口封装
 - `wrangler.jsonc`：云端部署配置
 
-> 边缘场景如 RP，尽量选 ZDR 服务商，有截断可以去 OpenRouter - Logs 看`content_guardrail_invoked`等字段，一个验证可行的prompt被截断，可能是技术错误，而非内容审查。
+> 边缘场景如 RP，尽量选 ZDR 服务商，有截断可以去 OpenRouter - Logs 看`content_guardrail_invoked`等字段，一个验证可行的prompt被截断，可能是服务商技术错误，而非内容审查。
+
+<img src="https://i.ibb.co/4wVgY8pk/Screenshot-2026-06-11-124628.png" alt="失效的例子" />
